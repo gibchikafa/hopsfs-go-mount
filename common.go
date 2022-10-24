@@ -4,12 +4,17 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"time"
 
 	"bazil.org/fuse"
 	"logicalclocks.com/hopsfs-mount/ugcache"
 )
+
+var r = regexp.MustCompile(`/*Projects/(?P<projectName>\w+)/(?P<datasetName>\w+)/*`)
 
 func ChmodOp(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 	loginfo("Setting attributes", Fields{Operation: Chmod, Path: path, Mode: req.Mode})
@@ -47,13 +52,21 @@ func ChownOp(attrs *Attrs, fileSystem *FileSystem, path string, uid uint32, gid 
 		return fmt.Errorf(fmt.Sprintf("Setattr failed. Unable to find user information. Path %s", path))
 	}
 
-	groupName = ugcache.LookupGroupName(gid)
-	if groupName == "" {
-		return fmt.Errorf(fmt.Sprintf("Setattr failed. Unable to find group information. Path %s", path))
+	if djb2([]byte(userName)) == djb2([]byte(os.Getenv("HADOOP_USERNAME"))) {
+		userName = os.Getenv("HADOOP_USERNAME")
+	}
+
+	groupName, err := getGroupNameFromPath(path)
+	if err != nil {
+		logwarn(err.Error(), Fields{Path: path})
+		groupName = ugcache.LookupGroupName(gid)
+		if groupName == "" {
+			return fmt.Errorf(fmt.Sprintf("Setattr failed. Unable to find group information. Path %s", path))
+		}
 	}
 
 	loginfo("Setting attributes", Fields{Operation: Chown, Path: path, UID: uid, User: userName, GID: gid, Group: groupName})
-	err := fileSystem.getDFSConnector().Chown(path, userName, groupName)
+	err = fileSystem.getDFSConnector().Chown(path, userName, groupName)
 
 	if err != nil {
 		return err
@@ -66,7 +79,7 @@ func ChownOp(attrs *Attrs, fileSystem *FileSystem, path string, uid uint32, gid 
 
 func UpdateTS(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 
-	// in future if we need access time then we can update the file system client to support it
+	// in future if we need access time then we cgroupNameFromPathan update the file system client to support it
 	if req.Valid.Atime() {
 		logdebug("The stat op in hopsfs client returns os.FileInfo which does not have access time. Ignoring atime for now", nil)
 	}
@@ -92,4 +105,25 @@ func UpdateTS(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.Setat
 	}
 
 	return nil
+}
+
+func djb2(bytes []byte) string {
+	hash := uint64(5381)
+
+	for _, b := range bytes {
+		hash = uint64(b) + hash + hash<<5
+	}
+
+	return "hops" + fmt.Sprintf("%v", hash)
+}
+
+func getGroupNameFromPath(path string) (string, error) {
+	loginfo("Getting group name from path", Fields{Path: path})
+	result := r.FindAllStringSubmatch(path, -1)
+	//names := r.SubexpNames()
+	if len(result) == 0 {
+		return "", errors.New("could not get project name and dataset name from path " + path)
+	}
+
+	return result[0][1] + "__" + result[0][2], nil
 }
