@@ -52,8 +52,8 @@ func ChownOp(attrs *Attrs, fileSystem *FileSystem, path string, uid uint32, gid 
 		return fmt.Errorf(fmt.Sprintf("Setattr failed. Unable to find user information. Path %s", path))
 	}
 
-	if djb2([]byte(userName)) == djb2([]byte(os.Getenv("HADOOP_USERNAME"))) {
-		userName = os.Getenv("HADOOP_USERNAME")
+	if userName == djb2([]byte(os.Getenv("HADOOP_USER_NAME"))) {
+		userName = os.Getenv("HADOOP_USER_NAME")
 	}
 
 	groupName, err := getGroupNameFromPath(path)

@@ -52,18 +52,20 @@ type hdfsAccessorImpl struct {
 	MetadataClient      *hdfs.Client // HDFS client used for metadata operations
 	MetadataClientMutex sync.Mutex   // Serializing all metadata operations for simplicity (for now), TODO: allow N concurrent operations
 	TLSConfig           TLSConfig    // enable/disable using tls
+	HopsfsUsername      string
 }
 
 var _ HdfsAccessor = (*hdfsAccessorImpl)(nil) // ensure hdfsAccessorImpl implements HdfsAccessor
 
 // Creates an instance of HdfsAccessor
-func NewHdfsAccessor(nameNodeAddresses string, clock Clock, tlsConfig TLSConfig) (HdfsAccessor, error) {
+func NewHdfsAccessor(nameNodeAddresses string, clock Clock, tlsConfig TLSConfig, hopsfsUsername string) (HdfsAccessor, error) {
 	nns := strings.Split(nameNodeAddresses, ",")
 
 	this := &hdfsAccessorImpl{
 		NameNodeAddresses: nns,
 		Clock:             clock,
 		TLSConfig:         tlsConfig,
+		HopsfsUsername:    hopsfsUsername,
 	}
 	return this, nil
 }
@@ -107,6 +109,11 @@ func (dfs *hdfsAccessorImpl) connectToNameNodeImpl() (*hdfs.Client, error) {
 		hadoopUserName = u
 	}
 	hadoopUserID = ugcache.LookupUId(hadoopUserName)
+	loginfo(fmt.Sprintf("Real username is %s , Hashed username is: %s, UID: %d", dfs.HopsfsUsername, hadoopUserName, hadoopUserID), nil)
+
+	if hadoopUserName == djb2([]byte(dfs.HopsfsUsername)) {
+		hadoopUserName = dfs.HopsfsUsername
+	}
 	if hadoopUserName != "root" && hadoopUserID == 0 {
 		logwarn(fmt.Sprintf("Unable to find user id for user: %s, returning uid: 0", hadoopUserName), nil)
 	}

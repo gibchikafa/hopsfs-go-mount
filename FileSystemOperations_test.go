@@ -261,7 +261,7 @@ func TestGitClone(t *testing.T) {
 func withMount(t testing.TB, srcDir string, fn func(mntPath string, hdfsAccessor HdfsAccessor)) {
 	t.Helper()
 	//initLogger("debug", false, "")
-	hdfsAccessor, _ := NewHdfsAccessor("localhost:8020", WallClock{}, TLSConfig{TLS: false})
+	hdfsAccessor, _ := NewHdfsAccessor("localhost:8020", WallClock{}, TLSConfig{TLS: false}, "hdfs")
 	err := hdfsAccessor.EnsureConnected()
 	if err != nil {
 		t.Fatalf(fmt.Sprintf("Error/NewHdfsAccessor: %v ", err), nil)

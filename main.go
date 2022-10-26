@@ -32,6 +32,7 @@ var readOnly *bool
 var tls *bool
 var connectors int
 var version *bool
+var hdfsUsername string
 
 func main() {
 
@@ -57,7 +58,7 @@ func main() {
 	ftHdfsAccessors := make([]HdfsAccessor, connectors)
 
 	for i := 0; i < connectors; i++ {
-		hdfsAccessor, err := NewHdfsAccessor(hopsRpcAddress, WallClock{}, tlsConfig)
+		hdfsAccessor, err := NewHdfsAccessor(hopsRpcAddress, WallClock{}, tlsConfig, hdfsUsername)
 		if err != nil {
 			logfatal(fmt.Sprintf("Error/NewHopsFSAccessor: %v ", err), nil)
 		}
@@ -154,6 +155,7 @@ func parseArgsAndInitLogger(retryPolicy *RetryPolicy) {
 	flag.StringVar(&mntSrcDir, "srcDir", "/", "HopsFS src directory")
 	flag.StringVar(&logFile, "logFile", "", "Log file path. By default the log is written to console")
 	flag.IntVar(&connectors, "numConnections", 1, "Number of connections with the namenode")
+	flag.StringVar(&hdfsUsername, "hdfsUsername", "hdfs", "Hadoop username")
 	version = flag.Bool("version", false, "Print version")
 
 	flag.Usage = Usage
@@ -176,6 +178,14 @@ func parseArgsAndInitLogger(retryPolicy *RetryPolicy) {
 		log.Fatalf("Error creating log file. Error: %v", err)
 	}
 	initLogger(logLevel, false, logFile)
+
+	//set the hadoop username in the environmental variable
+	loginfo(fmt.Sprintf("HADOOP_USER_NAME env var is: %s ", os.Getenv("HADOOP_USER_NAME")), nil)
+	if os.Getenv("HADOOP_USER_NAME") == "" {
+		loginfo(fmt.Sprintf("Setting HADOOP_USER_NAME env var to: %s ", hdfsUsername), nil)
+		os.Setenv("HADOOP_USER_NAME", hdfsUsername)
+	}
+	loginfo(fmt.Sprintf("HADOOP_USER_NAME env var after is: %s ", os.Getenv("HADOOP_USER_NAME")), nil)
 
 	loginfo(fmt.Sprintf("Staging dir is:%s, Using TLS: %v, RetryAttempts: %d,  LogFile: %s", stagingDir, *tls, retryPolicy.MaxAttempts, logFile), nil)
 	loginfo(fmt.Sprintf("hopsfs-mount: current head GITCommit: %s Built time: %s Built by: %s ", GITCOMMIT, BUILDTIME, HOSTNAME), nil)
