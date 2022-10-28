@@ -19,8 +19,6 @@ import (
 
 // Interface for accessing HDFS
 // Concurrency: thread safe: handles unlimited number of concurrent requests
-var hadoopUserName string = os.Getenv("HADOOP_USER_NAME")
-var hadoopUserID uint32 = 0
 
 type HdfsAccessor interface {
 	OpenRead(path string) (ReadSeekCloser, error) // Opens HDFS file for reading
@@ -101,31 +99,14 @@ func (dfs *hdfsAccessorImpl) ConnectToNameNode() (*hdfs.Client, error) {
 
 // Performs an attempt to connect to the HDFS name
 func (dfs *hdfsAccessorImpl) connectToNameNodeImpl() (*hdfs.Client, error) {
-	if hadoopUserName == "" {
-		u, err := ugcache.CurrentUserName()
-		if err != nil {
-			return nil, fmt.Errorf("couldn't determine user: %s", err)
-		}
-		hadoopUserName = u
-	}
-	hadoopUserID = ugcache.LookupUId(hadoopUserName)
-	loginfo(fmt.Sprintf("Real username is %s , Hashed username is: %s, UID: %d", dfs.HopsfsUsername, hadoopUserName, hadoopUserID), nil)
-
-	if hadoopUserName == djb2([]byte(dfs.HopsfsUsername)) {
-		hadoopUserName = dfs.HopsfsUsername
-	}
-	if hadoopUserName != "root" && hadoopUserID == 0 {
-		logwarn(fmt.Sprintf("Unable to find user id for user: %s, returning uid: 0", hadoopUserName), nil)
-	}
-
-	loginfo(fmt.Sprintf("Connecting as user: %s, UID: %d", hadoopUserName, hadoopUserID), nil)
+	loginfo(fmt.Sprintf("Connecting as user: %s", dfs.HopsfsUsername), nil)
 
 	// Performing an attempt to connect to the name node
 	// Colinmar's hdfs implementation has supported the multiple name node connection
 	hdfsOptions := hdfs.ClientOptions{
 		Addresses: dfs.NameNodeAddresses,
 		TLS:       dfs.TLSConfig.TLS,
-		User:      hadoopUserName,
+		User:      dfs.HopsfsUsername,
 	}
 
 	if dfs.TLSConfig.TLS {

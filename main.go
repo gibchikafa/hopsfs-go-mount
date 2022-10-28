@@ -180,12 +180,9 @@ func parseArgsAndInitLogger(retryPolicy *RetryPolicy) {
 	initLogger(logLevel, false, logFile)
 
 	//set the hadoop username in the environmental variable
+	loginfo(fmt.Sprintf("Setting HADOOP_USER_NAME env var to: %s ", hdfsUsername), nil)
+	os.Setenv("HADOOP_USER_NAME", hdfsUsername)
 	loginfo(fmt.Sprintf("HADOOP_USER_NAME env var is: %s ", os.Getenv("HADOOP_USER_NAME")), nil)
-	if os.Getenv("HADOOP_USER_NAME") == "" {
-		loginfo(fmt.Sprintf("Setting HADOOP_USER_NAME env var to: %s ", hdfsUsername), nil)
-		os.Setenv("HADOOP_USER_NAME", hdfsUsername)
-	}
-	loginfo(fmt.Sprintf("HADOOP_USER_NAME env var after is: %s ", os.Getenv("HADOOP_USER_NAME")), nil)
 
 	loginfo(fmt.Sprintf("Staging dir is:%s, Using TLS: %v, RetryAttempts: %d,  LogFile: %s", stagingDir, *tls, retryPolicy.MaxAttempts, logFile), nil)
 	loginfo(fmt.Sprintf("hopsfs-mount: current head GITCommit: %s Built time: %s Built by: %s ", GITCOMMIT, BUILDTIME, HOSTNAME), nil)
