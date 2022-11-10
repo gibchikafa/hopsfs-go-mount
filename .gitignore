@@ -3,3 +3,4 @@ mock_*
 hdfs-mount
 coverage.txt
 .idea/
+bin/*
