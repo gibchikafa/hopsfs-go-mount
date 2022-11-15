@@ -33,6 +33,7 @@ var tls *bool
 var connectors int
 var version *bool
 var hdfsUsername string
+var useGroupNamesFromPath *bool
 
 func main() {
 
@@ -74,7 +75,6 @@ func main() {
 	}
 
 	// Wrapping with FaultTolerantHdfsAccessor
-
 	if !*lazyMount && ftHdfsAccessors[0].EnsureConnected() != nil {
 		logfatal("Can't establish connection to HopsFS, mounting will NOT be performend (this can be suppressed with -lazy", nil)
 	}
@@ -155,7 +155,8 @@ func parseArgsAndInitLogger(retryPolicy *RetryPolicy) {
 	flag.StringVar(&mntSrcDir, "srcDir", "/", "HopsFS src directory")
 	flag.StringVar(&logFile, "logFile", "", "Log file path. By default the log is written to console")
 	flag.IntVar(&connectors, "numConnections", 1, "Number of connections with the namenode")
-	flag.StringVar(&hdfsUsername, "hdfsUsername", "hdfs", "Hadoop username")
+	flag.StringVar(&hdfsUsername, "hdfsUsername", "", "Hadoop username")
+	useGroupNamesFromPath = flag.Bool("useGroupFromFilePath", false, "Enable getting user group names from the file path")
 	version = flag.Bool("version", false, "Print version")
 
 	flag.Usage = Usage
@@ -178,11 +179,6 @@ func parseArgsAndInitLogger(retryPolicy *RetryPolicy) {
 		log.Fatalf("Error creating log file. Error: %v", err)
 	}
 	initLogger(logLevel, false, logFile)
-
-	//set the hadoop username in the environmental variable
-	loginfo(fmt.Sprintf("Setting HADOOP_USER_NAME env var to: %s ", hdfsUsername), nil)
-	os.Setenv("HADOOP_USER_NAME", hdfsUsername)
-	loginfo(fmt.Sprintf("HADOOP_USER_NAME env var is: %s ", os.Getenv("HADOOP_USER_NAME")), nil)
 
 	loginfo(fmt.Sprintf("Staging dir is:%s, Using TLS: %v, RetryAttempts: %d,  LogFile: %s", stagingDir, *tls, retryPolicy.MaxAttempts, logFile), nil)
 	loginfo(fmt.Sprintf("hopsfs-mount: current head GITCommit: %s Built time: %s Built by: %s ", GITCOMMIT, BUILDTIME, HOSTNAME), nil)

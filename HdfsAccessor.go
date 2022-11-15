@@ -258,14 +258,7 @@ func (dfs *hdfsAccessorImpl) AttrsFromFileInfo(fileInfo os.FileInfo) Attrs {
 
 	modificationTime := time.Unix(int64(fi.ModificationTime())/1000, 0)
 	gid := ugcache.LookupGid(fi.OwnerGroup())
-	if fi.OwnerGroup() != "root" && gid == 0 {
-		logwarn(fmt.Sprintf("Unable to find group id for group: %s, returning gid: 0", fi.OwnerGroup()), nil)
-	}
-
 	uid := ugcache.LookupUId(fi.Owner())
-	if fi.Owner() != "root" && uid == 0 {
-		logwarn(fmt.Sprintf("Unable to find user id for user: %s, returning uid: 0", fi.Owner()), nil)
-	}
 
 	return Attrs{
 		Inode:  fi.FileId(),

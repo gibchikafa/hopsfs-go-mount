@@ -6,7 +6,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"time"
 
@@ -52,21 +51,22 @@ func ChownOp(attrs *Attrs, fileSystem *FileSystem, path string, uid uint32, gid 
 		return fmt.Errorf(fmt.Sprintf("Setattr failed. Unable to find user information. Path %s", path))
 	}
 
-	if os.Getenv("HADOOP_USER_NAME") != "" {
-		userName = os.Getenv("HADOOP_USER_NAME")
+	if hdfsUsername != "" {
+		userName = hdfsUsername
 	}
 
-	groupName, err := getGroupNameFromPath(path)
-	if err != nil {
-		logwarn(err.Error(), Fields{Path: path})
-		groupName = ugcache.LookupGroupName(gid)
-		if groupName == "" {
+	if *useGroupNamesFromPath {
+		pathGroupName, err := getGroupNameFromPath(path)
+		if err != nil {
 			return fmt.Errorf(fmt.Sprintf("Setattr failed. Unable to find group information. Path %s", path))
 		}
+		groupName = pathGroupName
+	} else {
+		groupName = ugcache.LookupGroupName(gid)
 	}
 
 	loginfo("Setting attributes", Fields{Operation: Chown, Path: path, UID: uid, User: userName, GID: gid, Group: groupName})
-	err = fileSystem.getDFSConnector().Chown(path, userName, groupName)
+	err := fileSystem.getDFSConnector().Chown(path, userName, groupName)
 
 	if err != nil {
 		return err
