@@ -127,12 +127,6 @@ func main() {
 	if err != nil {
 		logfatal(fmt.Sprintf("Failed to serve FS. Error: %v", err), nil)
 	}
-
-	// check if the mount process has an error to report
-	<-c.Ready
-	if err := c.MountError; err != nil {
-		logfatal(fmt.Sprintf("Mount process had errors: %v", err), nil)
-	}
 }
 
 var Usage = func() {

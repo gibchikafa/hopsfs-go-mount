@@ -20,4 +20,4 @@ replace github.com/colinmarc/hdfs/v2 v2.2.0 => github.com/logicalclocks/hopsfs-g
 
 //replace github.com/colinmarc/hdfs/v2 v2.2.0 => /home/salman/code/hops/hopsfs-go/hopsfs-go-client
 
-//replace bazil.org/fuse v0.0.0-20200524192727-fb710f7dfd05 => /home/salman/code/hops/hopsfs-go/fuse
+replace bazil.org/fuse v0.0.0-20200524192727-fb710f7dfd05 => /home/gibson/work/fuse

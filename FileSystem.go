@@ -73,7 +73,7 @@ func (filesystem *FileSystem) Unmount(mountPoint string) {
 	}
 	filesystem.Mounted = false
 	loginfo("Unmounting...", nil)
-	cmd := exec.Command("fusermount", "-zu", mountPoint)
+	cmd := exec.Command("fusermount3", "-zu", mountPoint)
 	err := cmd.Run()
 
 	// Closing all the files
