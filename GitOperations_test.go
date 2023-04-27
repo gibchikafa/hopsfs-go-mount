@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/go-git/go-git/v5/plumbing"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,6 +174,52 @@ func TestGit2(t *testing.T) {
 	})
 }
 
+// test operations using go-git
+func TestGit3(t *testing.T) {
+	withMount(t, "/", func(mountPoint string, hdfsAccessor HdfsAccessor) {
+		repoName := "hops-examples.git"
+		cloneDir := "cloneDir1"
+
+		repoPath := filepath.Join(mountPoint, cloneDir)
+
+		//delete the dir if it already exists
+		_, err := os.Stat(repoPath)
+		if os.IsExist(err) {
+			err := rmDir(t, repoPath)
+			if err != nil {
+				t.Errorf("Faile to remove  %s. Error: %v", repoPath, err)
+			}
+		}
+
+		// clone repo
+		loginfo(fmt.Sprintf("Cloning at path: %s ", repoPath), nil)
+		gitCloneOptions := &git.CloneOptions{
+			URL:               fmt.Sprintf("%s%s", "https://github.com/logicalclocks/", repoName),
+			RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+			SingleBranch:      false,
+		}
+		repo, err := git.PlainClone(repoPath, false, gitCloneOptions)
+		require.Nil(t, err)
+		require.NotNil(t, repo)
+
+		// checkout to branch
+		branchName := "new_test_branch"
+		loginfo(fmt.Sprintf("Creating new branch: %s", branchName), nil)
+		headRef, err := repo.Head()
+		require.Nil(t, err)
+		// check if branch exist and return proper error
+		exist, _ := CheckIfBranchExits(repo, branchName)
+		require.Equal(t, exist, false)
+		branch := plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", branchName))
+		// Create a new plumbing.HashReference object with the name of the branch
+		// and the hash from the HEAD
+		ref := plumbing.NewHashReference(branch, headRef.Hash())
+		// The created reference is saved in the storage.
+		err = repo.Storer.SetReference(ref)
+		require.Nil(t, err)
+	})
+}
+
 func ExecuteOnPath(path string, cmd string) error {
 	loginfo(fmt.Sprintf("Executing command `%s` on path %s", cmd, path), nil)
 	args := strings.Split(cmd, " ")
@@ -187,4 +234,19 @@ func ExecuteOnPath(path string, cmd string) error {
 		return errors.New(err.Error() + ". " + buf.String())
 	}
 	return nil
+}
+
+func CheckIfBranchExits(repository *git.Repository, branchName string) (bool, error) {
+	exist := false
+	branches, err := repository.Branches()
+	if err != nil {
+		return exist, err
+	}
+	branches.ForEach(func(branch *plumbing.Reference) error {
+		if branch.Name().Short() == branchName {
+			exist = true
+		}
+		return nil
+	})
+	return exist, err
 }
