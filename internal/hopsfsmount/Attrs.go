@@ -5,9 +5,10 @@ package hopsfsmount
 
 import (
 	"os"
+	"syscall"
 	"time"
 
-	"bazil.org/fuse"
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // Attributes common to the file/directory HDFS nodes
@@ -32,29 +33,29 @@ type FsInfo struct {
 	remaining uint64
 }
 
-// Converts Attrs datastructure into FUSE represnetation
-func (attrs *Attrs) ConvertAttrToFuse(a *fuse.Attr) error {
-	a.Inode = attrs.Inode
-	a.Mode = attrs.Mode
-	if (a.Mode & os.ModeDir) == 0 {
-		a.Size = attrs.Size
-		// Set Blocks for du/stat to work correctly.
-		// Per POSIX, st_blocks is always in 512-byte units regardless of filesystem block size.
-		a.Blocks = (attrs.Size + 511) / 512
-	}
-	a.Uid = attrs.Uid
-	a.Gid = attrs.Gid
-	a.Mtime = attrs.Mtime
-	a.Ctime = attrs.Ctime
-	a.Valid = CacheAttrsTimeDuration
-	return nil
+// Converts Attrs datastructure into go-fuse representation.
+func (attrs *Attrs) ConvertAttrToFuse(out *fuse.AttrOut) {
+	out.Ino = attrs.Inode
+	out.Size = attrs.Size
+	// Set Blocks for du/stat to work correctly.
+	// Per POSIX, st_blocks is always in 512-byte units regardless of filesystem block size.
+	out.Blocks = (attrs.Size + 511) / 512
+	out.Owner = fuse.Owner{Uid: attrs.Uid, Gid: attrs.Gid}
+	out.SetTimes(nil, &attrs.Mtime, &attrs.Ctime)
 }
 
-// returns fuse.DirentType for this attributes (DT_Dir or DT_File)
-func (attrs *Attrs) FuseNodeType() fuse.DirentType {
+func (attrs *Attrs) StableMode() uint32 {
 	if (attrs.Mode & os.ModeDir) == os.ModeDir {
-		return fuse.DT_Dir
-	} else {
-		return fuse.DT_File
+		return syscall.S_IFDIR
 	}
+	return syscall.S_IFREG
+}
+
+func (attrs *Attrs) Permissions() uint32 {
+	return uint32(attrs.Mode.Perm())
+}
+
+// returns DirEntry mode for this attributes.
+func (attrs *Attrs) FuseNodeType() uint32 {
+	return attrs.StableMode()
 }

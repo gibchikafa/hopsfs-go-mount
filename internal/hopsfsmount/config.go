@@ -13,7 +13,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"bazil.org/fuse"
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/ugcache"
 )
@@ -198,31 +199,36 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-func GetMountOptions(ro bool) []fuse.MountOption {
-	mountOptions := []fuse.MountOption{fuse.FSName("hopsfs"),
-		fuse.Subtype("hopsfs"),
-		fuse.MaxReadahead(1024 * 64), //TODO: make configurable
+func GetMountOptions(ro bool) *fusefs.Options {
+	timeout := CacheAttrsTimeDuration
+	opts := &fusefs.Options{
+		EntryTimeout:    &timeout,
+		AttrTimeout:     &timeout,
+		NegativeTimeout: &timeout,
+		MountOptions: fuse.MountOptions{
+			FsName:       "hopsfs",
+			Name:         "hopsfs",
+			MaxReadAhead: 1024 * 64,
+			AllowOther:   AllowOther,
+			Options:      []string{"subtype=hopsfs"},
+		},
 	}
 
 	if EnableDefaultPermissions {
-		mountOptions = append(mountOptions, fuse.DefaultPermissions())
+		opts.MountOptions.Options = append(opts.MountOptions.Options, "default_permissions")
 	}
 
 	if EnablePageCache {
 		// https://www.kernel.org/doc/Documentation/filesystems/fuse-io.txt
 		logger.Warn("Linux page caches is enabled. "+
 			"It may cause problems in reading a file updated by external clients", nil)
-		mountOptions = append(mountOptions, fuse.WritebackCache())
-	}
-
-	if AllowOther {
-		mountOptions = append(mountOptions, fuse.AllowOther())
+		opts.MountOptions.Options = append(opts.MountOptions.Options, "writeback_cache")
 	}
 
 	if ro {
-		mountOptions = append(mountOptions, fuse.ReadOnly())
+		opts.MountOptions.Options = append(opts.MountOptions.Options, "ro")
 	}
-	return mountOptions
+	return opts
 }
 
 func validateFallBackUserAndGroup() error {

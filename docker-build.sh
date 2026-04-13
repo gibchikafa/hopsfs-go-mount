@@ -39,7 +39,7 @@ if [ "$PREFIX" != "" ]; then
 fi
 
 echo "Creating docker image ${DOCKER_IMAGE}"
-docker build --progress=plain --platform=$PLATFORM --build-arg userid=${USERID} --build-arg groupid=${GROUPID} . -t "$DOCKER_IMAGE"
+DOCKER_BUILDKIT=1 docker build --progress=plain --platform=$PLATFORM --build-arg userid=${USERID} --build-arg groupid=${GROUPID} . -t "$DOCKER_IMAGE"
 
 echo "Building $platform using $DOCKER_IMAGE"
 docker run --rm -v $DIR:/src -w /src --user hopsfs "$DOCKER_IMAGE" /bin/bash -l build 

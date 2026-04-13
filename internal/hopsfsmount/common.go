@@ -4,52 +4,51 @@
 package hopsfsmount
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 	"time"
-	"fmt"
 
-	"bazil.org/fuse"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/ugcache"
 )
 
-func ChmodOp(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	if attrs.Mode == req.Mode {
-		logger.Debug(fmt.Sprintf("Skipping chmod, mode already %v", req.Mode), logger.Fields{Operation: Chmod, Path: path})
+func ChmodOp(attrs *Attrs, fileSystem *FileSystem, path string, mode os.FileMode, out *fuse.AttrOut) error {
+	if attrs.Mode == mode {
+		logger.Debug(fmt.Sprintf("Skipping chmod, mode already %v", mode), logger.Fields{Operation: Chmod, Path: path})
 		return nil
 	}
-	logger.Info("Setting attributes", logger.Fields{Operation: Chmod, Path: path, Mode: req.Mode})
-	err := fileSystem.getDFSConnector().Chmod(path, req.Mode)
+	logger.Info("Setting attributes", logger.Fields{Operation: Chmod, Path: path, Mode: mode})
+	err := fileSystem.getDFSConnector().Chmod(path, mode)
 	if err != nil {
 		return err
-	} else {
-		attrs.Mode = req.Mode
-		resp.Attr.Mode = req.Mode
-		return nil
 	}
+	attrs.Mode = mode
+	fillAttrOut(attrs, out)
+	return nil
 }
 
-func SetAttrChownOp(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+func SetAttrChownOp(attrs *Attrs, fileSystem *FileSystem, path string, uid, gid *uint32, out *fuse.AttrOut) error {
 
 	var userName = attrs.DFSUserName
 	var groupName = attrs.DFSGroupName
 	var err error
 
-	if req.Valid.Uid() {
-		userName, err = getUserName(req.Uid)
+	if uid != nil {
+		userName, err = getUserName(*uid)
 		if err != nil {
 			logger.Error("Unable to find user information. ", logger.Fields{Operation: Setattr,
-				Path: path, UID: req.Uid, HopsFSUserName: GetConnectionUser()})
+				Path: path, UID: *uid, HopsFSUserName: GetConnectionUser()})
 			return err
 		}
 	}
 
-	if req.Valid.Gid() {
-		groupName, err = getGroupName(path, req.Gid)
+	if gid != nil {
+		groupName, err = getGroupName(path, *gid)
 		if err != nil {
 			logger.Error("Unable to find group information. ", logger.Fields{Operation: Setattr,
-				Path: path, GID: req.Gid, GetGroupFromHopsFSDatasetPath: UseGroupFromHopsFsDatasetPath})
+				Path: path, GID: *gid, GetGroupFromHopsFSDatasetPath: UseGroupFromHopsFsDatasetPath})
 			return err
 		}
 	}
@@ -66,15 +65,16 @@ func SetAttrChownOp(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse
 		return err
 	}
 
-	if req.Valid.Uid() {
-		attrs.Uid = req.Uid
+	if uid != nil {
+		attrs.Uid = *uid
 		attrs.DFSUserName = userName
 	}
 
-	if req.Valid.Gid() {
-		attrs.Gid = req.Gid
+	if gid != nil {
+		attrs.Gid = *gid
 		attrs.DFSGroupName = groupName
 	}
+	fillAttrOut(attrs, out)
 	return nil
 }
 
@@ -115,34 +115,40 @@ func getGroupName(path string, gid uint32) (string, error) {
 	}
 }
 
-func UpdateTS(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+func UpdateTS(attrs *Attrs, fileSystem *FileSystem, path string, req *fuse.SetAttrIn, out *fuse.AttrOut) error {
 
 	// in future if we need access time then we can update the file system client to support it
-	if req.Valid.Atime() {
+	if _, ok := req.GetATime(); ok {
 		logger.Debug("The stat op in hopsfs client returns os.FileInfo which does not have access time. Ignoring atime for now", nil)
 	}
 
-	if req.Valid.Mtime() {
-		attrs.Mtime = time.Unix(int64(req.Mtime.Second()), 0)
+	if mtime, ok := req.GetMTime(); ok {
+		attrs.Mtime = time.Unix(mtime.Unix(), 0)
 	}
 
-	if req.Valid.Handle() {
+	if _, ok := req.GetFh(); ok {
 		logger.Warn("Setattr Handle is not implemented yet.", nil)
 	}
 
-	if req.Valid.AtimeNow() {
+	if req.Valid&fuse.FATTR_ATIME_NOW != 0 {
 		logger.Debug("Setattr AtimeNow is not implemented yet.", nil)
 	}
 
-	if req.Valid.MtimeNow() {
+	if req.Valid&fuse.FATTR_MTIME_NOW != 0 {
 		logger.Debug("Setattr MtimeNow is not implemented yet.", nil)
 	}
 
-	if req.Valid.LockOwner() {
+	if req.Valid&fuse.FATTR_LOCKOWNER != 0 {
 		logger.Warn("Setattr LockOwner is not implemented yet.", nil)
 	}
 
+	fillAttrOut(attrs, out)
 	return nil
+}
+
+func fillAttrOut(attrs *Attrs, out *fuse.AttrOut) {
+	attrs.ConvertAttrToFuse(out)
+	out.Mode = attrs.Permissions()
 }
 
 func getGroupNameFromPath(path string) string {

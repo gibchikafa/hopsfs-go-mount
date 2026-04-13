@@ -4,7 +4,8 @@
 package hopsfsmount
 
 import (
-	"bazil.org/fuse"
+	"context"
+	"syscall"
 )
 
 // Wraps FileHandle exposing it as ReadSeekCloser intrface
@@ -24,10 +25,16 @@ func NewFileHandleAsReadSeekCloser(fileHandle *FileHandle) ReadSeekCloser {
 
 // Reads a chunk of data
 func (fhrs *FileHandleAsReadSeekCloser) Read(buffer []byte) (int, error) {
-	resp := fuse.ReadResponse{Data: buffer}
-	err := fhrs.FileHandle.Read(nil, &fuse.ReadRequest{Offset: fhrs.Offset, Size: len(buffer)}, &resp)
-	fhrs.Offset += int64(len(resp.Data))
-	return len(resp.Data), err
+	result, errno := fhrs.FileHandle.Read(context.Background(), buffer, fhrs.Offset)
+	if errno != 0 {
+		return 0, errno
+	}
+	data, status := result.Bytes(buffer)
+	if status != 0 {
+		return 0, syscall.Errno(status)
+	}
+	fhrs.Offset += int64(len(data))
+	return len(data), nil
 }
 
 // Seeks to a given position
@@ -45,5 +52,5 @@ func (fhrs *FileHandleAsReadSeekCloser) Position() (int64, error) {
 
 // Closes the underlying file handle
 func (fhrs *FileHandleAsReadSeekCloser) Close() error {
-	return fhrs.FileHandle.Release(nil, nil)
+	return fhrs.FileHandle.Release(context.Background())
 }

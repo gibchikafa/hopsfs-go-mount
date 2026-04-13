@@ -15,7 +15,7 @@ import (
 
 	"github.com/colinmarc/hdfs/v2"
 
-	"bazil.org/fuse"
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/ugcache"
 )
@@ -355,10 +355,6 @@ func isFuseOrSyscallError(err error) bool {
 		return true
 	case *syscall.Errno:
 		return true
-	case fuse.Errno:
-		return true
-	case *fuse.Errno:
-		return true
 	}
 	return false
 }
@@ -411,7 +407,6 @@ func unwrapAndTranslateError(err error) error {
 
 func isNonRetriableError(err error) bool {
 	if err == io.EOF ||
-		err == fuse.EEXIST ||
 		err == syscall.ENOENT ||
 		err == syscall.EACCES ||
 		err == syscall.EPERM ||
@@ -424,7 +419,7 @@ func isNonRetriableError(err error) bool {
 		err == syscall.ENOLINK {
 		return true
 	} else {
-		return false
+		return fusefs.ToErrno(err) == syscall.EEXIST
 	}
 }
 

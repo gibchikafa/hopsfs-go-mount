@@ -4,44 +4,49 @@
 package hopsfsmount
 
 import (
+	"context"
 	"fmt"
-	"github.com/colinmarc/hdfs/v2"
 	"os"
 	"path"
 	"sync"
 	"syscall"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"golang.org/x/net/context"
+	"github.com/colinmarc/hdfs/v2"
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 )
 
 // Encapsulates state and operations for directory node on the HDFS file system
 type DirINode struct {
+	fusefs.Inode
 	FileSystem    *FileSystem        // Pointer to the owning filesystem
 	Attrs         Attrs              // Cached attributes of the directory, TODO: add TTL
 	Parent        *DirINode          // Pointer to the parent directory (allows computing fully-qualified paths on demand)
-	children      map[string]fs.Node    // Cahed directory entries
-	negativeCache map[string]time.Time  // Caches "not found" results: name → expiry time
-	childrenMutex sync.Mutex            // for concurrent read and updates
-	dirMutex      sync.Mutex            // One read or write operation on a directory at a time
+	children      map[string]fusefs.InodeEmbedder // Cached directory entries
+	negativeCache map[string]time.Time            // Caches "not found" results: name → expiry time
+	childrenMutex sync.Mutex                      // for concurrent read and updates
+	dirMutex      sync.Mutex                      // One read or write operation on a directory at a time
 }
 
 // Verify that *Dir implements necesary FUSE interfaces
-var _ fs.Node = (*DirINode)(nil)
-var _ fs.HandleReadDirAller = (*DirINode)(nil)
-var _ fs.NodeStringLookuper = (*DirINode)(nil)
-var _ fs.NodeMkdirer = (*DirINode)(nil)
-var _ fs.NodeRemover = (*DirINode)(nil)
-var _ fs.NodeRenamer = (*DirINode)(nil)
-var _ fs.NodeForgetter = (*DirINode)(nil)
-var _ fs.NodeSymlinker = (*DirINode)(nil)
-var _ fs.NodeReadlinker = (*DirINode)(nil)
-var _ fs.NodeLinker = (*DirINode)(nil)
-var _ fs.NodeCreater = (*DirINode)(nil)
-var _ fs.NodeFsyncer = (*DirINode)(nil)
+var _ fusefs.InodeEmbedder = (*DirINode)(nil)
+var _ fusefs.NodeGetattrer = (*DirINode)(nil)
+var _ fusefs.NodeReaddirer = (*DirINode)(nil)
+var _ fusefs.NodeLookuper = (*DirINode)(nil)
+var _ fusefs.NodeMkdirer = (*DirINode)(nil)
+var _ fusefs.NodeUnlinker = (*DirINode)(nil)
+var _ fusefs.NodeRmdirer = (*DirINode)(nil)
+var _ fusefs.NodeRenamer = (*DirINode)(nil)
+var _ fusefs.NodeOnForgetter = (*DirINode)(nil)
+var _ fusefs.NodeSymlinker = (*DirINode)(nil)
+var _ fusefs.NodeReadlinker = (*DirINode)(nil)
+var _ fusefs.NodeLinker = (*DirINode)(nil)
+var _ fusefs.NodeCreater = (*DirINode)(nil)
+var _ fusefs.NodeSetattrer = (*DirINode)(nil)
+var _ fusefs.NodeFsyncer = (*DirINode)(nil)
+var _ fusefs.NodeStatfser = (*DirINode)(nil)
 
 // Returns absolute path of the dir in HDFS namespace
 func (dir *DirINode) AbsolutePath() string {
@@ -57,29 +62,30 @@ func (dir *DirINode) AbsolutePathForChild(name string) string {
 	return path.Join(dir.AbsolutePath(), name)
 }
 
-// Responds on FUSE request to get directory attributes
-func (dir *DirINode) Attr(ctx context.Context, a *fuse.Attr) error {
+// Responds on FUSE request to get directory attributes.
+func (dir *DirINode) Getattr(ctx context.Context, _ fusefs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
 	if dir.Parent != nil && dir.FileSystem.Clock.Now().After(dir.Attrs.Expires) {
-		_, err := dir.Parent.statInodeInHopsFS(GetattrDir, dir.Attrs.Name, &dir.Attrs)
+		_, err := dir.Parent.statInodeInHopsFS(ctx, GetattrDir, dir.Attrs.Name, &dir.Attrs)
 		if err != nil {
-			return err
+			return fusefs.ToErrno(err)
 		}
 	} else {
 		logger.Info("Stat successful. Returning from Cache ", logger.Fields{Operation: GetattrDir, Path: path.Join(dir.AbsolutePath()), FileSize: dir.Attrs.Size,
 			IsDir: dir.Attrs.Mode.IsDir(), IsRegular: dir.Attrs.Mode.IsRegular()})
 	}
-	return dir.Attrs.ConvertAttrToFuse(a)
+	fillAttrOut(&dir.Attrs, out)
+	return 0
 }
 
-func (dir *DirINode) getChildInode(operation, name string) fs.Node {
+func (dir *DirINode) getChildNode(operation, name string) fusefs.InodeEmbedder {
 	dir.lockChildrenMutex()
 	defer dir.unlockChildrenMutex()
 
 	if dir.children == nil {
-		dir.children = make(map[string]fs.Node)
+		dir.children = make(map[string]fusefs.InodeEmbedder)
 		return nil
 	}
 
@@ -93,24 +99,24 @@ func (dir *DirINode) getChildInode(operation, name string) fs.Node {
 	return node
 }
 
-func (dir *DirINode) addOrUpdateChildInodeAttrs(operation, name string, attrs Attrs) fs.Node {
+func (dir *DirINode) addOrUpdateChildInodeAttrs(operation, name string, attrs Attrs) fusefs.InodeEmbedder {
 	dir.lockChildrenMutex()
 	defer dir.unlockChildrenMutex()
 
 	if dir.children == nil {
-		dir.children = make(map[string]fs.Node)
+		dir.children = make(map[string]fusefs.InodeEmbedder)
 	}
 
 	if node, ok := dir.children[name]; ok {
-		if fnode, ok := (node).(*FileINode); ok {
+		if fnode, ok := node.(*FileINode); ok {
 			fnode.Attrs = attrs
-		} else if dnode, ok := (node).(*DirINode); ok {
+		} else if dnode, ok := node.(*DirINode); ok {
 			dnode.Attrs = attrs
 		}
 		logger.Debug("Children's List. addOrUpdateChildInodeAttrs. Update ", logger.Fields{Operation: operation, Parent: dir.AbsolutePath(), Child: name, NumChildren: len(dir.children)})
 		return node
 	} else {
-		var node fs.Node
+		var node fusefs.InodeEmbedder
 		if (attrs.Mode & os.ModeDir) == 0 {
 			node = &FileINode{FileSystem: dir.FileSystem, Parent: dir, Attrs: attrs}
 		} else {
@@ -133,12 +139,12 @@ func (dir *DirINode) removeChildInode(operation, name string) {
 }
 
 // used in rename. when an inode is moved from one dir to another
-func (dir *DirINode) adoptChildInode(operation, name string, node fs.Node) {
+func (dir *DirINode) adoptChildInode(operation, name string, node fusefs.InodeEmbedder) {
 	dir.lockChildrenMutex()
 	defer dir.unlockChildrenMutex()
 
 	if dir.children == nil {
-		dir.children = make(map[string]fs.Node)
+		dir.children = make(map[string]fusefs.InodeEmbedder)
 	}
 
 	if _, ok := dir.children[name]; ok {
@@ -150,21 +156,26 @@ func (dir *DirINode) adoptChildInode(operation, name string, node fs.Node) {
 	dir.children[name] = node
 }
 
-// Responds on FUSE request to lookup the directory
-func (dir *DirINode) Lookup(ctx context.Context, name string) (fs.Node, error) {
+// Responds on FUSE request to lookup the directory.
+func (dir *DirINode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fusefs.Inode, syscall.Errno) {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
-	return dir.LookupInt(Lookup, name)
+	return dir.LookupInt(ctx, Lookup, name, out)
 }
 
-func (dir *DirINode) LookupInt(opName string, name string) (fs.Node, error) {
+func (dir *DirINode) LookupInt(ctx context.Context, opName string, name string, out *fuse.EntryOut) (*fusefs.Inode, syscall.Errno) {
 	if !dir.FileSystem.IsPathAllowed(dir.AbsolutePathForChild(name)) {
 		return nil, syscall.ENOENT
 	}
 
-	if node := dir.getChildInode(opName, name); node != nil {
-		return node, nil
+	if node := dir.getChildNode(opName, name); node != nil {
+		attrs := nodeAttributes(node)
+		fillEntryOut(&attrs, out)
+		if child := dir.GetChild(name); child != nil {
+			return child, 0
+		}
+		return dir.newChildInode(ctx, node), 0
 	}
 
 	// Check negative cache before hitting the backend
@@ -173,15 +184,16 @@ func (dir *DirINode) LookupInt(opName string, name string) (fs.Node, error) {
 	}
 
 	var attrs Attrs
-	node, err := dir.statInodeInHopsFS(opName, name, &attrs)
+	node, err := dir.statInodeInHopsFS(ctx, opName, name, &attrs)
 	if err != nil {
-		return nil, err
+		return nil, fusefs.ToErrno(err)
 	}
-	return node, nil
+	fillEntryOut(&attrs, out)
+	return dir.newChildInode(ctx, node), 0
 }
 
-// Responds on FUSE request to read directory
-func (dir *DirINode) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+// Responds on FUSE request to read directory.
+func (dir *DirINode) Readdir(ctx context.Context) (fusefs.DirStream, syscall.Errno) {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
@@ -191,28 +203,28 @@ func (dir *DirINode) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	allAttrs, err := dir.FileSystem.getDFSConnector().ReadDir(absolutePath)
 	if err != nil {
 		logger.Warn("Failed to list DFS directory", logger.Fields{Operation: ReadDir, Path: absolutePath, Error: err})
-		return nil, err
+		return nil, fusefs.ToErrno(err)
 	}
 
-	entries := make([]fuse.Dirent, 0, len(allAttrs))
+	entries := make([]fuse.DirEntry, 0, len(allAttrs))
 	for _, a := range allAttrs {
 		if dir.FileSystem.IsPathAllowed(dir.AbsolutePathForChild(a.Name)) {
-			// Creating Dirent structure as required by FUSE
-			entries = append(entries, fuse.Dirent{
-				Inode: a.Inode,
-				Name:  a.Name,
-				Type:  a.FuseNodeType()})
+			entries = append(entries, fuse.DirEntry{
+				Ino:  a.Inode,
+				Name: a.Name,
+				Mode: a.FuseNodeType(),
+			})
 			// Speculatively pre-creating child Dir or File node with cached attributes,
 			// since it's highly likely that we will have Lookup() call for this name
 			// This is the key trick which dramatically speeds up 'ls'
 			dir.addOrUpdateChildInodeAttrs(ReadDir, a.Name, a)
 		}
 	}
-	return entries, nil
+	return fusefs.NewListDirStream(entries), 0
 }
 
-// Performs Stat() query on the backend
-func (dir *DirINode) statInodeInHopsFS(operation, name string, attrs *Attrs) (fs.Node, error) {
+// Performs Stat() query on the backend.
+func (dir *DirINode) statInodeInHopsFS(_ context.Context, operation, name string, attrs *Attrs) (fusefs.InodeEmbedder, error) {
 
 	a, err := dir.FileSystem.getDFSConnector().Stat(path.Join(dir.AbsolutePath(), name))
 	if err != nil {
@@ -231,117 +243,133 @@ func (dir *DirINode) statInodeInHopsFS(operation, name string, attrs *Attrs) (fs
 	return inode, nil
 }
 
-// Responds on FUSE Mkdir request
-func (dir *DirINode) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+// Responds on FUSE Mkdir request.
+func (dir *DirINode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fusefs.Inode, syscall.Errno) {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
+	reqMode := ComputePermissions(os.ModeDir | os.FileMode(mode))
+	uid, gid := currentCallerIDs(ctx)
+
 	// check user and group information first.
-	userName, err := getUserName(req.Uid)
+	userName, err := getUserName(uid)
 	if err != nil {
 		logger.Error("Unable to find user information. ", logger.Fields{Operation: Mkdir,
-			Path: dir.AbsolutePathForChild(req.Name), UID: req.Uid, HopsFSUserName: GetConnectionUser()})
-		return nil, err
+			Path: dir.AbsolutePathForChild(name), UID: uid, HopsFSUserName: GetConnectionUser()})
+		return nil, fusefs.ToErrno(err)
 	}
 
-	groupName, err := getGroupName(dir.AbsolutePathForChild(req.Name), req.Gid)
+	groupName, err := getGroupName(dir.AbsolutePathForChild(name), gid)
 	if err != nil {
 		logger.Error("Unable to find group information. ", logger.Fields{Operation: Mkdir,
-			Path: dir.AbsolutePathForChild(req.Name), GID: req.Gid,
+			Path: dir.AbsolutePathForChild(name), GID: gid,
 			GetGroupFromHopsFSDatasetPath: UseGroupFromHopsFsDatasetPath})
-		return nil, err
+		return nil, fusefs.ToErrno(err)
 	}
-	req.Mode = ComputePermissions(req.Mode)
-	err = dir.FileSystem.getDFSConnector().MkdirWithGroup(dir.AbsolutePathForChild(req.Name), req.Mode, groupName)
+	err = dir.FileSystem.getDFSConnector().MkdirWithGroup(dir.AbsolutePathForChild(name), reqMode, groupName)
 	if err != nil {
-		logger.Info("mkdir failed", logger.Fields{Operation: Mkdir, Path: path.Join(dir.AbsolutePath(), req.Name), Error: err})
-		return nil, err
+		logger.Info("mkdir failed", logger.Fields{Operation: Mkdir, Path: path.Join(dir.AbsolutePath(), name), Error: err})
+		return nil, fusefs.ToErrno(err)
 	}
-	logger.Debug("mkdir successful with group", logger.Fields{Operation: Mkdir, Path: path.Join(dir.AbsolutePath(), req.Name), Group: groupName})
+	logger.Debug("mkdir successful with group", logger.Fields{Operation: Mkdir, Path: path.Join(dir.AbsolutePath(), name), Group: groupName})
 
-	dir.removeNegativeCacheEntry(req.Name)
-	newInode := dir.addOrUpdateChildInodeAttrs(Mkdir, req.Name,
+	dir.removeNegativeCacheEntry(name)
+	attrs := Attrs{
+		Name:         name,
+		Mode:         reqMode | os.ModeDir,
+		Uid:          uid,
+		Gid:          gid,
+		DFSUserName:  userName,
+		DFSGroupName: groupName,
+	}
+	newNode := dir.addOrUpdateChildInodeAttrs(Mkdir, name,
 		Attrs{
-			Name:         req.Name,
-			Mode:         req.Mode | os.ModeDir,
-			Uid:          req.Uid,
-			Gid:          req.Gid,
+			Name:         name,
+			Mode:         reqMode | os.ModeDir,
+			Uid:          uid,
+			Gid:          gid,
 			DFSUserName:  userName,
 			DFSGroupName: groupName,
 		})
-	return newInode, nil
+	fillEntryOut(&attrs, out)
+	return dir.newChildInode(ctx, newNode), 0
 }
 
-// Responds on FUSE Create request
-func (dir *DirINode) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+// Responds on FUSE Create request.
+func (dir *DirINode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fusefs.Inode, fusefs.FileHandle, uint32, syscall.Errno) {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
-	req.Mode = ComputePermissions(req.Mode)
-	logger.Info("Creating a new file", logger.Fields{Operation: Create, Path: dir.AbsolutePathForChild(req.Name), Mode: req.Mode, Flags: req.Flags})
+	reqMode := ComputePermissions(os.FileMode(mode))
+	logger.Info("Creating a new file", logger.Fields{Operation: Create, Path: dir.AbsolutePathForChild(name), Mode: reqMode, Flags: flags})
+	uid, gid := currentCallerIDs(ctx)
 
 	// first determine the usename and grup name for the new file
-	userName, err := getUserName(req.Uid)
+	userName, err := getUserName(uid)
 	if err != nil {
 		logger.Error("Unable to find user information. ", logger.Fields{Operation: Create,
-			Path: dir.AbsolutePathForChild(req.Name), UID: req.Uid, HopsFSUserName: GetConnectionUser()})
-		return nil, nil, err
+			Path: dir.AbsolutePathForChild(name), UID: uid, HopsFSUserName: GetConnectionUser()})
+		return nil, nil, 0, fusefs.ToErrno(err)
 	}
 
-	groupName, err := getGroupName(dir.AbsolutePathForChild(req.Name), req.Gid)
+	groupName, err := getGroupName(dir.AbsolutePathForChild(name), gid)
 	if err != nil {
 		logger.Error("Unable to find group information. ", logger.Fields{Operation: Create,
-			Path: dir.AbsolutePathForChild(req.Name), GID: req.Gid,
+			Path: dir.AbsolutePathForChild(name), GID: gid,
 			GetGroupFromHopsFSDatasetPath: UseGroupFromHopsFsDatasetPath})
-		return nil, nil, err
+		return nil, nil, 0, fusefs.ToErrno(err)
 	}
 
 	newFileAttrs := Attrs{
-		Name:         req.Name,
-		Mode:         req.Mode,
-		Uid:          req.Uid,
-		Gid:          req.Gid,
+		Name:         name,
+		Mode:         reqMode,
+		Uid:          uid,
+		Gid:          gid,
 		DFSUserName:  userName,
 		DFSGroupName: groupName,
 	}
 
-	dir.removeNegativeCacheEntry(req.Name)
-	file := (dir.addOrUpdateChildInodeAttrs(Create, req.Name, newFileAttrs)).(*FileINode)
-	handle, err := file.NewFileHandle(false, req.Flags)
+	dir.removeNegativeCacheEntry(name)
+	file := dir.addOrUpdateChildInodeAttrs(Create, name, newFileAttrs).(*FileINode)
+	handle, err := file.NewFileHandle(false, flags)
 	if err != nil {
-		logger.Error("File creation failed", logger.Fields{Operation: Create, Path: dir.AbsolutePathForChild(req.Name), Mode: req.Mode, Flags: req.Flags, Error: err})
-		dir.removeChildInode(Create, req.Name)
-		return nil, nil, err
+		logger.Error("File creation failed", logger.Fields{Operation: Create, Path: dir.AbsolutePathForChild(name), Mode: reqMode, Flags: flags, Error: err})
+		dir.removeChildInode(Create, name)
+		return nil, nil, 0, fusefs.ToErrno(err)
 	}
 	// Note: handle is already added to activeHandles inside NewFileHandle
 	// File created with groupname parameter - no chown needed
 	logger.Debug("File created with group", logger.Fields{
 		Operation: Create,
-		Path:      dir.AbsolutePathForChild(req.Name),
+		Path:      dir.AbsolutePathForChild(name),
 		User:      userName,
 		Group:     groupName,
 	})
 
 	//update the attributes of the file now
-	_, err = dir.statInodeInHopsFS(Create, file.Attrs.Name, &file.Attrs)
+	node, err := dir.statInodeInHopsFS(ctx, Create, file.Attrs.Name, &file.Attrs)
 	if err != nil {
-		dir.removeChildInode(Create, req.Name)
-		return nil, nil, err
+		dir.removeChildInode(Create, name)
+		return nil, nil, 0, fusefs.ToErrno(err)
 	}
 
-	return file, handle, nil
+	fillEntryOut(&file.Attrs, out)
+	fuseFlags := uint32(0)
+	if !EnablePageCache {
+		fuseFlags = fuse.FOPEN_DIRECT_IO
+	}
+	return dir.newChildInode(ctx, node), handle, fuseFlags, 0
 }
 
-// Responds on FUSE Remove request
-func (dir *DirINode) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+func (dir *DirINode) removeName(name string) syscall.Errno {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
-	path := dir.AbsolutePathForChild(req.Name)
+	path := dir.AbsolutePathForChild(name)
 	logger.Debug("Removing path", logger.Fields{Operation: Remove, Path: path})
 	err := dir.FileSystem.getDFSConnector().Remove(path)
 	if err == nil {
-		dir.removeChildInode(Remove, req.Name)
+		dir.removeChildInode(Remove, name)
 		// Invalidate staging file cache for the removed path
 		if StagingCache != nil {
 			StagingCache.Remove(path)
@@ -350,38 +378,61 @@ func (dir *DirINode) Remove(ctx context.Context, req *fuse.RemoveRequest) error 
 	} else {
 		logger.Warn("Failed to remove path", logger.Fields{Operation: Remove, Path: path, Error: err})
 	}
-	return err
+	return fusefs.ToErrno(err)
 }
 
-// Responds on FUSE Rename request
-func (srcParent *DirINode) Rename(ctx context.Context, req *fuse.RenameRequest, dstParentDir fs.Node) error {
+func (dir *DirINode) Unlink(ctx context.Context, name string) syscall.Errno {
+	return dir.removeName(name)
+}
+
+func (dir *DirINode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	return dir.removeName(name)
+}
+
+// Responds on FUSE Rename request.
+func (srcParent *DirINode) Rename(ctx context.Context, oldName string, newParent fusefs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	srcParent.lockMutex()
 	defer srcParent.unlockMutex()
 
-	return srcParent.renameInt(Rename, req.OldName, req.NewName, dstParentDir, hdfs.RENAME_OPTION_NONE)
-}
+	if flags&fusefs.RENAME_EXCHANGE == fusefs.RENAME_EXCHANGE ||
+		flags&0x4 == 0x4 {
+		logger.Error("Rename. Unsupported Flags ", logger.Fields{Operation: Rename, Flags: flags})
+		return syscall.EINVAL
+	}
 
-func (srcParent *DirINode) renameInt(operationName, oldName, newName string, dstParentDir fs.Node, options hdfs.RenameOptions) error {
+	options := hdfs.RENAME_OPTION_NONE
+	if flags&0x1 == 0x1 {
+		options = options | hdfs.RENAME_NOREPLACE
+	}
+
+	dstParentDir := newParent.(*DirINode)
 	oldPath := srcParent.AbsolutePathForChild(oldName)
-	newPath := dstParentDir.(*DirINode).AbsolutePathForChild(newName)
-	logger.Debug("Renaming", logger.Fields{Operation: operationName, From: oldPath, To: newPath})
+	newPath := dstParentDir.AbsolutePathForChild(newName)
+	logger.Debug("Renaming", logger.Fields{Operation: Rename, From: oldPath, To: newPath})
 
-	srcInode, err := srcParent.LookupInt(Rename, oldName)
-	if err != nil {
-		logger.Error("Rename failed. Src Inode not found", logger.Fields{Operation: operationName, From: oldPath, To: newPath})
-		return err
+	srcInode := srcParent.getChildNode(Rename, oldName)
+	if srcInode == nil {
+		var out fuse.EntryOut
+		_, errno := srcParent.LookupInt(ctx, Rename, oldName, &out)
+		if errno != 0 {
+			logger.Error("Rename failed. Src Inode not found", logger.Fields{Operation: Rename, From: oldPath, To: newPath})
+			return errno
+		}
+		srcInode = srcParent.getChildNode(Rename, oldName)
 	}
 
-	dstInode, err := dstParentDir.(*DirINode).LookupInt(Rename, newName)
-	if err == nil {
-		logger.Debug("Rename. Dst Inode not found", logger.Fields{Operation: operationName, From: oldPath, To: newPath})
+	dstInode := dstParentDir.getChildNode(Rename, newName)
+	if dstInode == nil {
+		var out fuse.EntryOut
+		if _, errno := dstParentDir.LookupInt(ctx, Rename, newName, &out); errno == 0 {
+			dstInode = dstParentDir.getChildNode(Rename, newName)
+		}
 	}
 
-	// update backend
-	err = srcParent.FileSystem.getDFSConnector().Rename2(oldPath, newPath, options)
+	err := srcParent.FileSystem.getDFSConnector().Rename2(oldPath, newPath, hdfs.RenameOptions(options))
 	if err != nil {
-		logger.Error("Rename failed at the backend", logger.Fields{Operation: operationName, From: oldPath, To: newPath, Error: err})
-		return err
+		logger.Error("Rename failed at the backend", logger.Fields{Operation: Rename, From: oldPath, To: newPath, Error: err})
+		return fusefs.ToErrno(err)
 	}
 
 	// Transfer staging file cache entry from old path to new path if it exists
@@ -389,110 +440,149 @@ func (srcParent *DirINode) renameInt(operationName, oldName, newName string, dst
 		StagingCache.Rename(oldPath, newPath)
 	}
 
-	// disconnect src inode
 	if srcInode != nil {
 		srcParent.removeChildInode(Rename, oldName)
 	}
-
-	// disconnect dst inode
 	if dstInode != nil {
-		dstParentDir.(*DirINode).removeChildInode(Rename, newName)
+		dstParentDir.removeChildInode(Rename, newName)
 	}
+	dstParentDir.removeNegativeCacheEntry(newName)
 
-	// Invalidate negative cache for the new name in the destination directory
-	dstParentDir.(*DirINode).removeNegativeCacheEntry(newName)
-
-	// Upon successful rename, updating in-memory representation of the file entry
-	// file rename
-	if fnode, ok := (srcInode).(*FileINode); ok {
-		logger.Trace("Rename src is file", logger.Fields{Operation: operationName, From: oldPath, To: newPath})
+	if fnode, ok := srcInode.(*FileINode); ok {
+		logger.Trace("Rename src is file", logger.Fields{Operation: Rename, From: oldPath, To: newPath})
 		fnode.Attrs.Name = newName
-		fnode.Parent = dstParentDir.(*DirINode)
-		dstParentDir.(*DirINode).adoptChildInode(Rename, newName, fnode)
+		fnode.Parent = dstParentDir
+		dstParentDir.adoptChildInode(Rename, newName, fnode)
 	}
-
-	// dir rename
-	if dnode, ok := (srcInode).(*DirINode); ok {
-		logger.Trace("Rename src is dir", logger.Fields{Operation: operationName, From: oldPath, To: newPath})
+	if dnode, ok := srcInode.(*DirINode); ok {
+		logger.Trace("Rename src is dir", logger.Fields{Operation: Rename, From: oldPath, To: newPath})
 		dnode.Attrs.Name = newName
-		dnode.Parent = dstParentDir.(*DirINode)
-		dstParentDir.(*DirINode).adoptChildInode(Rename, newName, dnode)
+		dnode.Parent = dstParentDir
+		dstParentDir.adoptChildInode(Rename, newName, dnode)
 	}
 
-	logger.Info("Renamed", logger.Fields{Operation: operationName, From: oldPath, To: newPath})
-	return nil
+	logger.Info("Renamed", logger.Fields{Operation: Rename, From: oldPath, To: newPath})
+	return 0
 }
 
-// Responds on FUSE Rename request
-func (srcParent *DirINode) Rename2(ctx context.Context, req *fuse.Rename2Request, dstParentDir fs.Node) error {
-	srcParent.lockMutex()
-	defer srcParent.unlockMutex()
-
-	if req.Flags&fuse.RENAME_EXCHANGE == fuse.RENAME_EXCHANGE ||
-		req.Flags&fuse.RENAME_WHITEOUT == fuse.RENAME_WHITEOUT {
-		logger.Error("Rename2. Unsupported Flags ", logger.Fields{Operation: Rename2, Flags: req.Flags.String()})
-		return syscall.EINVAL
-	}
-
-	options := hdfs.RENAME_OPTION_NONE
-	if req.Flags&fuse.RENAME_NOREPLACE == fuse.RENAME_NOREPLACE {
-		options = options | hdfs.RENAME_NOREPLACE
-	}
-
-	return srcParent.renameInt(Rename2, req.OldName, req.NewName, dstParentDir, hdfs.RenameOptions(options))
-}
-
-// Responds on FUSE Chmod request
-func (dir *DirINode) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+// Responds on FUSE Chmod request.
+func (dir *DirINode) Setattr(ctx context.Context, _ fusefs.FileHandle, req *fuse.SetAttrIn, resp *fuse.AttrOut) syscall.Errno {
 	dir.lockMutex()
 	defer dir.unlockMutex()
 
 	path := dir.AbsolutePath()
 
-	if req.Valid.Size() {
+	if _, ok := req.GetSize(); ok {
 		logger.Error(fmt.Sprintf("Unsupported operation. Can not set size of a directory"), logger.Fields{Operation: Chmod, Path: path})
 		return syscall.ENOTSUP
 	}
 
-	if req.Valid.Mode() {
-		if err := ChmodOp(&dir.Attrs, dir.FileSystem, path, req, resp); err != nil {
-			logger.Warn("Setattr (chmod) failed. ", logger.Fields{Operation: Chmod, Path: path, Mode: req.Mode})
-			return err
+	if mode, ok := req.GetMode(); ok {
+		if err := ChmodOp(&dir.Attrs, dir.FileSystem, path, os.ModeDir|os.FileMode(mode), resp); err != nil {
+			logger.Warn("Setattr (chmod) failed. ", logger.Fields{Operation: Chmod, Path: path, Mode: mode})
+			return fusefs.ToErrno(err)
 		}
 	}
 
-	if req.Valid.Uid() || req.Valid.Gid() {
-		if err := SetAttrChownOp(&dir.Attrs, dir.FileSystem, path, req, resp); err != nil {
-			logger.Warn("Setattr (chown/chgrp )failed", logger.Fields{Operation: Chmod, Path: path, UID: req.Uid, GID: req.Gid})
-			return err
+	var uidPtr, gidPtr *uint32
+	if uid, ok := req.GetUID(); ok {
+		uidPtr = &uid
+	}
+	if gid, ok := req.GetGID(); ok {
+		gidPtr = &gid
+	}
+	if uidPtr != nil || gidPtr != nil {
+		if err := SetAttrChownOp(&dir.Attrs, dir.FileSystem, path, uidPtr, gidPtr, resp); err != nil {
+			logger.Warn("Setattr (chown/chgrp )failed", logger.Fields{Operation: Chmod, Path: path})
+			return fusefs.ToErrno(err)
 		}
 	}
 
 	if err := UpdateTS(&dir.Attrs, dir.FileSystem, path, req, resp); err != nil {
-		return err
+		return fusefs.ToErrno(err)
 	}
 
-	return nil
+	return 0
 }
 
-// Responds on FUSE request to forget inode
-func (dir *DirINode) Forget() {
+func (dir *DirINode) OnForget() {
 	dir.lockMutex()
 	defer dir.unlockMutex()
-	// inodes are removed on delete and rename operations.
-	// this forget call is redundant and it causes problems.
-	// In the mount point we identify inodes by names.
-	// For example, we remove a file /some/dir/file. Before
-	// the forget call is processed if the user recreates the
-	// file /some/dir/file then processing forget request
-	// would lead to deleting a correct inode
-	// to fix this issue we have to use inode IDs
-
-	// ask parent to remove me from the children list
-	// logger.Debug(fmt.Sprintf("Forget for dir %s", dir.Attrs.Name), nil)
-	// dir.Parent.removeChildInode(Forget, dir.Attrs.Name)
 }
 
+func (dir *DirINode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fusefs.Inode, syscall.Errno) {
+	logger.Error("Unsupported Symlink operation.", logger.Fields{Operation: Symlink, Path: dir.AbsolutePath()})
+	return nil, syscall.ENOTSUP
+}
+
+func (dir *DirINode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	logger.Error("Unsupported Readlink operation.", logger.Fields{Operation: ReadLink, Path: dir.AbsolutePath()})
+	return nil, syscall.ENOTSUP
+}
+
+func (dir *DirINode) Link(ctx context.Context, old fusefs.InodeEmbedder, name string, out *fuse.EntryOut) (*fusefs.Inode, syscall.Errno) {
+	logger.Error("Unsupported Link operation.", logger.Fields{Operation: Link, Path: dir.AbsolutePath()})
+	return nil, syscall.ENOTSUP
+}
+
+// Synchronize directory contents.
+// All dir operations are first performed on the backend. So no-op.
+func (dir *DirINode) Fsync(ctx context.Context, _ fusefs.FileHandle, flags uint32) syscall.Errno {
+	logger.Info("Fsync called on Dir ", logger.Fields{Operation: Fsync, Path: dir.AbsolutePath(), Flags: flags})
+	return 0
+}
+
+func (dir *DirINode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	fsInfo, err := dir.FileSystem.getDFSConnector().StatFs()
+	if err != nil {
+		logger.Warn("Stat DFS failed", logger.Fields{Operation: StatFS, Error: err})
+		return fusefs.ToErrno(err)
+	}
+	out.Bsize = 1024
+	out.Bfree = fsInfo.remaining / uint64(out.Bsize)
+	out.Bavail = out.Bfree
+	out.Blocks = fsInfo.capacity / uint64(out.Bsize)
+	return 0
+}
+
+func (dir *DirINode) newChildInode(ctx context.Context, node fusefs.InodeEmbedder) *fusefs.Inode {
+	name := nodeAttributes(node).Name
+	if child := dir.GetChild(name); child != nil {
+		return child
+	}
+	attrs := nodeAttributes(node)
+	return dir.NewInode(ctx, node, fusefs.StableAttr{Mode: attrs.StableMode(), Ino: attrs.Inode})
+}
+
+func nodeAttributes(node fusefs.InodeEmbedder) Attrs {
+	switch n := node.(type) {
+	case *DirINode:
+		return n.Attrs
+	case *FileINode:
+		return n.Attrs
+	default:
+		return Attrs{}
+	}
+}
+
+func fillEntryOut(attrs *Attrs, out *fuse.EntryOut) {
+	out.Ino = attrs.Inode
+	out.Mode = attrs.Permissions()
+	out.Size = attrs.Size
+	out.Blocks = (attrs.Size + 511) / 512
+	out.Owner = fuse.Owner{Uid: attrs.Uid, Gid: attrs.Gid}
+	out.SetTimes(nil, &attrs.Mtime, &attrs.Ctime)
+	out.SetEntryTimeout(CacheAttrsTimeDuration)
+	out.SetAttrTimeout(CacheAttrsTimeDuration)
+}
+
+func currentCallerIDs(ctx context.Context) (uint32, uint32) {
+	if caller, ok := fuse.FromContext(ctx); ok && caller != nil {
+		return caller.Uid, caller.Gid
+	}
+	owner := fuse.CurrentOwner()
+	return owner.Uid, owner.Gid
+}
 // checkNegativeCache returns true if the name is in the negative cache and not expired.
 // Must NOT hold childrenMutex when calling this.
 func (dir *DirINode) checkNegativeCache(operation, name string) bool {
@@ -555,27 +645,4 @@ func (dir *DirINode) lockChildrenMutex() {
 
 func (dir *DirINode) unlockChildrenMutex() {
 	dir.childrenMutex.Unlock()
-}
-
-func (dir *DirINode) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, error) {
-	logger.Error("Unsupported Symlink operation.", logger.Fields{Operation: Symlink, Path: dir.AbsolutePath()})
-	return nil, syscall.ENOTSUP
-}
-
-func (dir *DirINode) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string, error) {
-	logger.Error("Unsupported Readlink operation.", logger.Fields{Operation: ReadLink, Path: dir.AbsolutePath()})
-	return "", syscall.ENOTSUP
-}
-
-func (dir *DirINode) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (fs.Node, error) {
-	logger.Error("Unsupported Link operation.", logger.Fields{Operation: Link, Path: dir.AbsolutePath()})
-	return nil, syscall.ENOTSUP
-}
-
-// https://libfuse.github.io/doxygen/structfuse__operations.html#abaa2a0bdc9b9955a399ea6973f6f4927
-// Synchronize directory contents
-// All dir operations are first performed on the backend. So no-op
-func (dir *DirINode) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	logger.Info("Fsync called on Dir ", logger.Fields{Operation: Fsync, Path: dir.AbsolutePath()})
-	return nil
 }

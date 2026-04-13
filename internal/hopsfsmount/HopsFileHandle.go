@@ -3,34 +3,34 @@
 package hopsfsmount
 
 import (
+	"context"
 	"io"
 	"sync"
 	"syscall"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"golang.org/x/net/context"
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 )
 
 // Represents a handle to an open file
 type FileHandle struct {
 	File              *FileINode
-	mutex             sync.Mutex     // all operations on the handle are serialized to simplify invariants
-	fileFlags         fuse.OpenFlags // flags used to creat the file
+	mutex             sync.Mutex // all operations on the handle are serialized to simplify invariants
+	fileFlags         uint32     // flags used to create/open the file
 	tatalBytesRead    int64
 	totalBytesWritten int64
 	fhID              uint64 // file handle id. for debugging only
 }
 
 // Verify that *FileHandle implements necesary FUSE interfaces
-var _ fs.Node = (*FileHandle)(nil)
-var _ fs.HandleReader = (*FileHandle)(nil)
-var _ fs.HandleReleaser = (*FileHandle)(nil)
-var _ fs.HandleWriter = (*FileHandle)(nil)
-var _ fs.NodeFsyncer = (*FileHandle)(nil)
-var _ fs.HandleFlusher = (*FileHandle)(nil)
-var _ fs.HandlePoller = (*FileHandle)(nil)
+var _ fusefs.FileHandle = (*FileHandle)(nil)
+var _ fusefs.FileReader = (*FileHandle)(nil)
+var _ fusefs.FileReleaser = (*FileHandle)(nil)
+var _ fusefs.FileWriter = (*FileHandle)(nil)
+var _ fusefs.FileFsyncer = (*FileHandle)(nil)
+var _ fusefs.FileFlusher = (*FileHandle)(nil)
+var _ fusefs.FileGetattrer = (*FileHandle)(nil)
 
 func (fh *FileHandle) dataChanged() bool {
 	if fh.totalBytesWritten > 0 {
@@ -66,62 +66,59 @@ func (fh *FileHandle) Truncate(size int64) error {
 	return nil
 }
 
-// Returns attributes of the file associated with this handle
-// Delegates to File.Attr which handles its own locking (fileMutex → fileHandleMutex)
+// Returns attributes of the file associated with this handle.
+// Delegates to File.Getattr which handles its own locking (fileMutex → fileHandleMutex)
 // Note: No dataMutex here to avoid invalid lock order dataMutex (3) → fileMutex (2)
-func (fh *FileHandle) Attr(ctx context.Context, a *fuse.Attr) error {
-	return fh.File.Attr(ctx, a)
+func (fh *FileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
+	return fh.File.Getattr(ctx, fh, out)
 }
 
 // Responds to FUSE Read request
 // Lock order: dataMutex (3) alone
-func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+func (fh *FileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	fh.File.lockData()
 	defer fh.File.unlockData()
 
-	buf := resp.Data[0:req.Size]
-	nr, err := fh.File.fileProxy.ReadAt(buf, req.Offset)
-	resp.Data = buf[0:nr]
+	nr, err := fh.File.fileProxy.ReadAt(dest, off)
 	fh.tatalBytesRead += int64(nr)
 
 	if err != nil {
 		if err == io.EOF {
 			logger.Debug("Completed reading", fh.logInfo(logger.Fields{Operation: Read, Error: err, Bytes: nr}))
 			if nr >= 0 {
-				return nil
+				return fuse.ReadResultData(dest[:nr]), 0
 			} else {
-				return err
+				return nil, fusefs.ToErrno(err)
 			}
 		} else {
 			logger.Error("Failed to read", fh.logInfo(logger.Fields{Operation: Read, Error: err, Bytes: nr}))
-			return err
+			return nil, fusefs.ToErrno(err)
 		}
 	}
-	return err
+	return fuse.ReadResultData(dest[:nr]), 0
 }
 
 // Responds to FUSE Write request
 // Lock order: dataMutex (3) → fileHandleMutex (1) via upgradeHandleForWriting
-func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+func (fh *FileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	fh.File.lockData()
 	defer fh.File.unlockData()
 
 	// as an optimization the file is initially opened in readonly mode
 	fh.File.upgradeHandleForWriting(fh, Write)
 
-	nw, err := fh.File.fileProxy.WriteAt(req.Data, req.Offset)
-	resp.Size = nw
+	nw, err := fh.File.fileProxy.WriteAt(data, off)
 	fh.totalBytesWritten += int64(nw)
 	if err != nil {
 		logger.Error("Failed to write to staging file", fh.logInfo(logger.Fields{Operation: Write, Error: err}))
-		return err
+		return uint32(nw), fusefs.ToErrno(err)
 	}
 
 	// Mark file as dirty (protected by dataMutex we're holding)
 	fh.File.markDirty()
 
-	logger.Trace("Write data to staging file", fh.logInfo(logger.Fields{Operation: Write, Bytes: nw, ReqOffset: req.Offset}))
-	return nil
+	logger.Trace("Write data to staging file", fh.logInfo(logger.Fields{Operation: Write, Bytes: nw, ReqOffset: off}))
+	return uint32(nw), 0
 }
 
 // Responds to the FUSE Flush request.
@@ -132,24 +129,24 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 // returning from close(). If we defer upload to Release, subsequent file operations
 // may start before the previous file's upload is complete.
 // Lock order: dataMutex (3) → fileHandleMutex (1) via flushToDFS
-func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+func (fh *FileHandle) Flush(ctx context.Context) syscall.Errno {
 	fh.File.lockData()
 	defer fh.File.unlockData()
-	return fh.File.flushToDFS(Flush)
+	return fusefs.ToErrno(fh.File.flushToDFS(Flush))
 }
 
 // Responds to the FUSE Fsync request
 // Lock order: dataMutex (3) → fileHandleMutex (1) via flushToDFS
-func (fh *FileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+func (fh *FileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno {
 	// If delaySyncUntilClose is enabled, skip fsync until file close
 	if fh.File.FileSystem.DelaySyncUntilClose {
 		logger.Debug("Fsync deferred until close", fh.logInfo(logger.Fields{Operation: Fsync}))
-		return nil
+		return 0
 	}
 
 	fh.File.lockData()
 	defer fh.File.unlockData()
-	return fh.File.flushToDFS(Fsync)
+	return fusefs.ToErrno(fh.File.flushToDFS(Fsync))
 }
 
 // Closes the handle
@@ -159,7 +156,7 @@ func (fh *FileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 // before the close() syscall returns. Calling flushToDFS here would mean retries could
 // happen after close() returns, breaking application expectations.
 // Lock order: dataMutex (3) → fileHandleMutex (1) via RemoveHandle
-func (fh *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
+func (fh *FileHandle) Release(_ context.Context) syscall.Errno {
 	fh.File.lockData()
 	defer fh.File.unlockData()
 
@@ -168,12 +165,7 @@ func (fh *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
 	fh.File.RemoveHandle(fh)
 
 	logger.Info("Closed file handle ", fh.logInfo(logger.Fields{Operation: Close, Flags: fh.fileFlags, TotalBytesRead: fh.tatalBytesRead, TotalBytesWritten: fh.totalBytesWritten}))
-	return nil
-}
-
-func (fh *FileHandle) Poll(ctx context.Context, req *fuse.PollRequest, resp *fuse.PollResponse) error {
-	logger.Warn("Polling is not supported ", fh.logInfo(logger.Fields{Operation: Poll}))
-	return syscall.ENOSYS
+	return 0
 }
 
 func (fh *FileHandle) logInfo(fields logger.Fields) logger.Fields {

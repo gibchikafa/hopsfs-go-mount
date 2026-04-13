@@ -12,8 +12,6 @@ import (
 	"strings"
 	"syscall"
 
-	"bazil.org/fuse/fs"
-	_ "bazil.org/fuse/fs/fstestutil"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 )
@@ -74,7 +72,7 @@ func main() {
 	}
 
 	mountOptions := hopsfsmount.GetMountOptions(hopsfsmount.ReadOnly)
-	c, err := fileSystem.Mount(mountPoint, mountOptions...)
+	c, err := fileSystem.Mount(mountPoint, mountOptions)
 	if err != nil {
 		logger.Fatal(fmt.Sprintf("Failed to mount FS. Error: %v", err), nil)
 	}
@@ -95,7 +93,7 @@ func main() {
 		}
 		fileSystem.Unmount(mountPoint)
 		logger.Info("Closing...", nil)
-		c.Close()
+		c.Unmount()
 		logger.Info("Closed...", nil)
 	}()
 
@@ -113,10 +111,7 @@ func main() {
 			retryPolicy.MaxDelay = 0
 		}
 	}()
-	err = fs.Serve(c, fileSystem)
-	if err != nil {
-		logger.Fatal(fmt.Sprintf("Failed to serve FS. Error: %v", err), nil)
-	}
+	c.Wait()
 }
 
 func createStagingDir() {

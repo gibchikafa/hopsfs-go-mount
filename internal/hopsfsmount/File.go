@@ -5,6 +5,7 @@
 package hopsfsmount
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math/rand"
@@ -14,9 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"golang.org/x/net/context"
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sys/unix"
 	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 )
@@ -40,6 +40,7 @@ import (
 //   - fileHandleMutex (1) → fileMutex (2)
 //   - dataMutex (3) → fileMutex (2) or vice versa
 type FileINode struct {
+	fusefs.Inode
 	FileSystem *FileSystem // pointer to the FieSystem which owns this file
 	Attrs      Attrs       // Cache of file attributes // TODO: implement TTL
 	Parent     *DirINode   // Pointer to the parent directory (allows computing fully-qualified paths on demand)
@@ -54,20 +55,21 @@ type FileINode struct {
 }
 
 // Verify that *File implements necesary FUSE interfaces
-var _ fs.Node = (*FileINode)(nil)
-var _ fs.NodeOpener = (*FileINode)(nil)
-var _ fs.NodeFsyncer = (*FileINode)(nil)
-var _ fs.NodeSetattrer = (*FileINode)(nil)
-var _ fs.NodeForgetter = (*FileINode)(nil)
+var _ fusefs.InodeEmbedder = (*FileINode)(nil)
+var _ fusefs.NodeGetattrer = (*FileINode)(nil)
+var _ fusefs.NodeOpener = (*FileINode)(nil)
+var _ fusefs.NodeFsyncer = (*FileINode)(nil)
+var _ fusefs.NodeSetattrer = (*FileINode)(nil)
+var _ fusefs.NodeOnForgetter = (*FileINode)(nil)
 
 // Retuns absolute path of the file in HDFS namespace
 func (file *FileINode) AbsolutePath() string {
 	return path.Join(file.Parent.AbsolutePath(), file.Attrs.Name)
 }
 
-// Responds to the FUSE file attribute request
+// Responds to the FUSE file attribute request.
 // Lock order: fileMutex (2) → fileHandleMutex (1)
-func (file *FileINode) Attr(ctx context.Context, a *fuse.Attr) error {
+func (file *FileINode) Getattr(ctx context.Context, _ fusefs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	file.lockFile()
 	defer file.unlockFile()
 
@@ -80,49 +82,47 @@ func (file *FileINode) Attr(ctx context.Context, a *fuse.Attr) error {
 		file.unlockFileHandles()
 		if err != nil {
 			logger.Warn("stat failed on staging file", logger.Fields{Operation: GetattrFile, Path: file.AbsolutePath(), Error: err})
-			return err
+			return fusefs.ToErrno(err)
 		}
 		// update the local cache (fileMutex already held)
 		file.Attrs.Size = uint64(fileInfo.Size())
 		file.Attrs.Mtime = fileInfo.ModTime()
-		return file.Attrs.ConvertAttrToFuse(a)
+		fillAttrOut(&file.Attrs, out)
+		return 0
 	}
 	file.unlockFileHandles()
 
 	// No local proxy - use cache or fetch from backend
 	if file.FileSystem.Clock.Now().After(file.Attrs.Expires) {
-		_, err := file.Parent.statInodeInHopsFS(GetattrFile, file.Attrs.Name, &file.Attrs)
+		_, err := file.Parent.statInodeInHopsFS(ctx, GetattrFile, file.Attrs.Name, &file.Attrs)
 		if err != nil {
-			return err
+			return fusefs.ToErrno(err)
 		}
 	} else {
 		logger.Info("Stat successful. Returning from Cache ", logger.Fields{Operation: GetattrFile, Path: file.AbsolutePath(), FileSize: file.Attrs.Size, IsDir: file.Attrs.Mode.IsDir(), IsRegular: file.Attrs.Mode.IsRegular()})
 	}
-	return file.Attrs.ConvertAttrToFuse(a)
+	fillAttrOut(&file.Attrs, out)
+	return 0
 }
 
 // Responds to the FUSE file open request (creates new file handle)
 // Lock order: fileMutex (2) → fileHandleMutex (1) via NewFileHandle
-func (file *FileINode) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+func (file *FileINode) Open(ctx context.Context, flags uint32) (fusefs.FileHandle, uint32, syscall.Errno) {
 	file.lockFile()
 	defer file.unlockFile()
 
-	logger.Debug("Opening file", logger.Fields{Operation: Open, Path: file.AbsolutePath(), Flags: req.Flags, FileSize: file.Attrs.Size})
-	handle, err := file.NewFileHandle(true, req.Flags)
+	logger.Debug("Opening file", logger.Fields{Operation: Open, Path: file.AbsolutePath(), Flags: flags, FileSize: file.Attrs.Size})
+	handle, err := file.NewFileHandle(true, flags)
 	if err != nil {
-		logger.Error("Opening file failed", logger.Fields{Operation: Open, Path: file.AbsolutePath(), Flags: req.Flags, FileSize: file.Attrs.Size, Error: err})
-		return nil, err
+		logger.Error("Opening file failed", logger.Fields{Operation: Open, Path: file.AbsolutePath(), Flags: flags, FileSize: file.Attrs.Size, Error: err})
+		return nil, 0, fusefs.ToErrno(err)
 	}
 
 	// if page cache is not enabled then read directly from HopsFS
 	if !EnablePageCache {
-		resp.Flags = fuse.OpenDirectIO
+		return handle, fuse.FOPEN_DIRECT_IO, 0
 	}
-
-	resp.Handle = fuse.HandleID(handle.fhID)
-
-	// Note: handle is already added to activeHandles inside NewFileHandle
-	return handle, nil
+	return handle, 0, 0
 }
 
 // Unregisters an opened file handle
@@ -337,17 +337,17 @@ func (file *FileINode) flushAttempt(operation string) error {
 
 // Responds to the FUSE Fsync request
 // Lock order: dataMutex (3) → fileHandleMutex (1) via flushToDFS
-func (file *FileINode) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+func (file *FileINode) Fsync(ctx context.Context, _ fusefs.FileHandle, _ uint32) syscall.Errno {
 	// If delaySyncUntilClose is enabled, skip fsync until file close
 	if file.FileSystem.DelaySyncUntilClose {
 		logger.Debug("Fsync deferred until close", file.logInfo(logger.Fields{Operation: Fsync}))
-		return nil
+		return 0
 	}
 
 	logger.Info("Fsync file", file.logInfo(logger.Fields{Operation: Fsync}))
 	file.lockData()
 	defer file.unlockData()
-	return file.flushToDFS(Fsync)
+	return fusefs.ToErrno(file.flushToDFS(Fsync))
 }
 
 // Invalidates metadata cache, so next ls or stat gives up-to-date file attributes
@@ -358,10 +358,10 @@ func (file *FileINode) InvalidateMetadataCache() {
 
 // Responds on FUSE Chmod request
 // Lock order: fileHandleMutex (1) alone for size change, fileMutex (2) alone for other attrs
-func (file *FileINode) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+func (file *FileINode) Setattr(ctx context.Context, _ fusefs.FileHandle, req *fuse.SetAttrIn, resp *fuse.AttrOut) syscall.Errno {
 	logger.Debug("Setattr request received: ", logger.Fields{Operation: Setattr})
 
-	if req.Valid.Size() {
+	if size, ok := req.GetSize(); ok {
 		// Take a snapshot of handles and release lock before dispatching
 		// This avoids deadlock when handle methods call upgradeHandleForWriting()
 		file.lockFileHandles()
@@ -370,16 +370,16 @@ func (file *FileINode) Setattr(ctx context.Context, req *fuse.SetattrRequest, re
 		file.unlockFileHandles()
 
 		logger.Info(fmt.Sprintf("Dispatching truncate request to all open handles: %d", len(handles)), logger.Fields{Operation: Setattr})
-		var err_out error = nil
+		var errOut error
 		for _, handle := range handles {
-			err := handle.Truncate(int64(req.Size))
+			err := handle.Truncate(int64(size))
 			if err != nil {
-				err_out = err
+				errOut = err
 			}
-			resp.Attr.Size = req.Size
-			file.Attrs.Size = req.Size
+			resp.Size = size
+			file.Attrs.Size = size
 		}
-		return err_out
+		return fusefs.ToErrno(errOut)
 	}
 
 	// For other setattr operations, use fileMutex to protect metadata
@@ -388,28 +388,35 @@ func (file *FileINode) Setattr(ctx context.Context, req *fuse.SetattrRequest, re
 
 	path := file.AbsolutePath()
 
-	if req.Valid.Mode() {
-		if err := ChmodOp(&file.Attrs, file.FileSystem, path, req, resp); err != nil {
-			return err
+	if mode, ok := req.GetMode(); ok {
+		if err := ChmodOp(&file.Attrs, file.FileSystem, path, os.FileMode(mode), resp); err != nil {
+			return fusefs.ToErrno(err)
 		}
 	}
 
-	if req.Valid.Uid() || req.Valid.Gid() {
-		if err := SetAttrChownOp(&file.Attrs, file.FileSystem, path, req, resp); err != nil {
-			return err
+	var uidPtr, gidPtr *uint32
+	if uid, ok := req.GetUID(); ok {
+		uidPtr = &uid
+	}
+	if gid, ok := req.GetGID(); ok {
+		gidPtr = &gid
+	}
+	if uidPtr != nil || gidPtr != nil {
+		if err := SetAttrChownOp(&file.Attrs, file.FileSystem, path, uidPtr, gidPtr, resp); err != nil {
+			return fusefs.ToErrno(err)
 		}
 	}
 
 	if err := UpdateTS(&file.Attrs, file.FileSystem, path, req, resp); err != nil {
-		return err
+		return fusefs.ToErrno(err)
 	}
 
-	return nil
+	return 0
 }
 
 // Responds on FUSE request to forget inode
 // Lock order: fileMutex (2) alone
-func (file *FileINode) Forget() {
+func (file *FileINode) OnForget() {
 	file.lockFile()
 	defer file.unlockFile()
 	// see comment in Dir.go for Forget handler
@@ -516,7 +523,7 @@ func (file *FileINode) downloadToStaging(stagingFile *os.File, operation string)
 // NewFileHandle creates new file handle
 // Lock order: fileHandleMutex (1) alone
 // Called from Open which holds fileMutex (2), so order is: fileMutex (2) → fileHandleMutex (1)
-func (file *FileINode) NewFileHandle(existsInDFS bool, flags fuse.OpenFlags) (*FileHandle, error) {
+func (file *FileINode) NewFileHandle(existsInDFS bool, flags uint32) (*FileHandle, error) {
 	file.lockFileHandles()
 	defer file.unlockFileHandles()
 

@@ -8,10 +8,10 @@ require (
 	github.com/colinmarc/hdfs/v2 v2.2.0
 	github.com/go-git/go-git/v5 v5.5.2
 	github.com/golang/mock v1.6.0
+	github.com/hanwen/go-fuse/v2 v2.8.0
 	github.com/sirupsen/logrus v1.8.1
 	github.com/stretchr/testify v1.8.1
-	golang.org/x/net v0.12.0
-	golang.org/x/sys v0.10.0
+	golang.org/x/sys v0.28.0
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0
 )
 
@@ -42,6 +42,7 @@ require (
 	github.com/skeema/knownhosts v1.1.0 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	golang.org/x/crypto v0.11.0 // indirect
+	golang.org/x/net v0.12.0 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

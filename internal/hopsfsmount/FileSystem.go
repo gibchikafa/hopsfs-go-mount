@@ -5,21 +5,18 @@ package hopsfsmount
 
 import (
 	"fmt"
-	"runtime"
-	"strconv"
-
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
-
-	"golang.org/x/net/context"
-
 	"io"
 	"os"
 	"os/exec"
 	"os/user"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"hopsworks.ai/hopsfsmount/internal/hopsfsmount/logger"
 )
 
 type FileSystem struct {
@@ -38,10 +35,6 @@ type FileSystem struct {
 	closeOnUnmountLock sync.Mutex  // mutex to protet closeOnUnmount
 }
 
-// Verify that *FileSystem implements necesary FUSE interfaces
-var _ fs.FS = (*FileSystem)(nil)
-var _ fs.FSStatfser = (*FileSystem)(nil)
-
 // Creates an instance of mountable file system
 func NewFileSystem(hdfsAccessors []HdfsAccessor, srcDir string, allowedPrefixes []string, readOnly bool, delaySyncUntilClose bool, retryPolicy *RetryPolicy, clock Clock) (*FileSystem, error) {
 	return &FileSystem{
@@ -56,18 +49,17 @@ func NewFileSystem(hdfsAccessors []HdfsAccessor, srcDir string, allowedPrefixes 
 }
 
 // Mounts the filesystem
-func (filesystem *FileSystem) Mount(mountPoint string, conf ...fuse.MountOption) (*fuse.Conn, error) {
-	var conn *fuse.Conn
-	var err error
-	conn, err = fuse.Mount(
-		mountPoint,
-		conf...,
-	)
+func (filesystem *FileSystem) Mount(mountPoint string, opts *fusefs.Options) (*fuse.Server, error) {
+	root, err := filesystem.Root()
+	if err != nil {
+		return nil, err
+	}
+	server, err := fusefs.Mount(mountPoint, root, opts)
 	if err != nil {
 		return nil, err
 	}
 	filesystem.Mounted = true
-	return conn, nil
+	return server, nil
 }
 
 // Unmounts the filesysten (invokes fusermount tool)
@@ -92,8 +84,8 @@ func (filesystem *FileSystem) Unmount(mountPoint string) {
 	}
 }
 
-// Returns root directory of the filesystem
-func (filesystem *FileSystem) Root() (fs.Node, error) {
+// Returns root directory of the filesystem.
+func (filesystem *FileSystem) Root() (*DirINode, error) {
 	//get UID and GID for the current user
 	cu, err := user.Current()
 	if err != nil {
@@ -134,21 +126,6 @@ func (filesystem *FileSystem) CloseOnUnmount(file io.Closer) {
 	filesystem.closeOnUnmountLock.Lock()
 	defer filesystem.closeOnUnmountLock.Unlock()
 	filesystem.closeOnUnmount = append(filesystem.closeOnUnmount, file)
-}
-
-// Statfs is called to obtain file system metadata.
-// It should write that data to resp.
-func (filesystem *FileSystem) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.StatfsResponse) error {
-	fsInfo, err := filesystem.getDFSConnector().StatFs()
-	if err != nil {
-		logger.Warn("Stat DFS failed", logger.Fields{Operation: StatFS, Error: err})
-		return err
-	}
-	resp.Bsize = 1024
-	resp.Bfree = fsInfo.remaining / uint64(resp.Bsize)
-	resp.Bavail = resp.Bfree
-	resp.Blocks = fsInfo.capacity / uint64(resp.Bsize)
-	return nil
 }
 
 func (filesystem *FileSystem) getDFSConnector() HdfsAccessor {
